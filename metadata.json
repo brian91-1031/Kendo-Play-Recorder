@@ -1,0 +1,5 @@
+{
+  "name": "Kendo Bracket Master",
+  "description": "A smart Kendo tournament manager that uses AI to parse brackets, manages match progression, records detailed scores, and visualizes the tournament tree.",
+  "requestFramePermissions": []
+}
