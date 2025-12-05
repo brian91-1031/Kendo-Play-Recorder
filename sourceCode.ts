@@ -1,4 +1,452 @@
-import React, { useState, useEffect, useRef } from 'react';
+
+export const FILES = {
+  "metadata.json": `{
+  "name": "Kendo Bracket Master",
+  "description": "A smart Kendo tournament manager that uses AI to parse brackets, manages match progression, records detailed scores, and visualizes the tournament tree.",
+  "requestFramePermissions": []
+}`,
+  "index.html": `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Kendo Bracket Master</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+      body {
+        font-family: 'Noto Sans TC', sans-serif;
+        background-color: #f3f4f6;
+      }
+      /* Custom Scrollbar for bracket view */
+      .bracket-scroll::-webkit-scrollbar {
+        height: 8px;
+        width: 8px;
+      }
+      .bracket-scroll::-webkit-scrollbar-track {
+        background: #f1f1f1;
+      }
+      .bracket-scroll::-webkit-scrollbar-thumb {
+        background: #cbd5e1;
+        border-radius: 4px;
+      }
+      .bracket-scroll::-webkit-scrollbar-thumb:hover {
+        background: #94a3b8;
+      }
+    </style>
+  <script type="importmap">
+{
+  "imports": {
+    "react/": "https://aistudiocdn.com/react@^19.2.0/",
+    "react": "https://aistudiocdn.com/react@^19.2.0",
+    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.30.0",
+    "lucide-react": "https://aistudiocdn.com/lucide-react@^0.554.0",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+    "jszip": "https://jspm.dev/jszip"
+  }
+}
+</script>
+</head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/index.tsx"></script>
+  </body>
+</html>`,
+  "index.tsx": `import React from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+
+const root = createRoot(document.getElementById('root')!);
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);`,
+  "types.ts": `
+export interface Player {
+  id: string;
+  name: string;
+}
+
+export interface MatchResult {
+  winnerId: string;
+  redScore: number;
+  whiteScore: number;
+  details: string; // e.g. "Men, Kote"
+}
+
+export interface Match {
+  id: number;
+  // If null, it means the slot is waiting for a winner from another match
+  redPlayerId: string | null; 
+  whitePlayerId: string | null;
+  
+  // Navigation logic
+  winnerToMatchId: number | null; // ID of the next match the winner goes to
+  winnerToSlot: 'red' | 'white' | null; // Explicitly target a slot
+  
+  loserToMatchId: number | null; // Optional
+  loserToSlot: 'red' | 'white' | null; // Explicitly target a slot
+  
+  result: MatchResult | null;
+}
+
+export interface TournamentData {
+  id: string; // Unique ID for storage
+  lastUpdated: number; // Timestamp
+  title: string;
+  players: Player[];
+  matches: Match[];
+  totalMatches: number;
+  status: 'SETUP' | 'ACTIVE' | 'FINISHED';
+}
+
+export interface ExtractedData {
+  title: string;
+  totalMatches: number;
+  players: string[];
+}`,
+  "services/geminiService.ts": `import { GoogleGenAI, Type } from "@google/genai";
+import { ExtractedData } from "../types";
+
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+export const analyzeBracketImage = async (base64Image: string): Promise<ExtractedData> => {
+  try {
+    const prompt = \`
+      Analyze this Kendo tournament bracket image.
+      
+      Tasks:
+      1. **Title**: Find the main title at the top (e.g., "個人賽-國中女子組").
+      2. **Total Matches**: Look for the number at the very top root of the bracket tree. This number usually represents the total number of matches or the final match ID. Return this as 'totalMatches'.
+      3. **Players**: Identify all player names. 
+         - They are usually located at the very bottom of the tree.
+         - **Crucial**: The names are often written vertically (one character per line) in Chinese.
+         - Read the vertical columns from left to right (or based on the numbers 1, 2, 3... above them if present).
+         - Combine the vertical characters into full names (e.g., "王小明").
+      
+      Return JSON only.
+    \`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: {
+        parts: [
+          {
+            inlineData: {
+              mimeType: "image/jpeg",
+              data: base64Image,
+            },
+          },
+          { text: prompt },
+        ],
+      },
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            title: { type: Type.STRING },
+            totalMatches: { type: Type.INTEGER },
+            players: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+            },
+          },
+          required: ["title", "totalMatches", "players"],
+        },
+      },
+    });
+
+    if (response.text) {
+      return JSON.parse(response.text) as ExtractedData;
+    }
+    throw new Error("No response text from Gemini");
+  } catch (error) {
+    console.error("Error analyzing image:", error);
+    throw error;
+  }
+};`,
+  "components/MatchCard.tsx": `
+import React from 'react';
+import { Match, Player } from '../types';
+
+interface MatchCardProps {
+  match: Match;
+  players: Player[];
+  onScore: (matchId: number) => void;
+  onWalkover: (matchId: number) => void;
+  highlight?: boolean;
+  sourceCount: number; // Number of matches feeding into this one
+  redSourceExist?: boolean;
+  whiteSourceExist?: boolean;
+}
+
+export const MatchCard: React.FC<MatchCardProps> = ({ 
+    match, 
+    players, 
+    onScore, 
+    onWalkover, 
+    highlight, 
+    sourceCount,
+    redSourceExist = false,
+    whiteSourceExist = false
+}) => {
+  const getPlayerName = (id: string | null) => {
+    if (!id) return null;
+    const p = players.find(p => p.id === id);
+    return p ? p.name : "未知選手";
+  };
+
+  const redName = getPlayerName(match.redPlayerId);
+  const whiteName = getPlayerName(match.whitePlayerId);
+  
+  const isFinished = !!match.result;
+  
+  // Ready: Both players present
+  const isReady = match.redPlayerId && match.whitePlayerId && !match.result;
+  
+  // Bye / Walkover Logic:
+  // We need to know if a slot is "effectively empty" (empty AND no one is coming).
+  const isRedEmpty = !match.redPlayerId && !redSourceExist;
+  const isWhiteEmpty = !match.whitePlayerId && !whiteSourceExist;
+
+  const hasRed = !!match.redPlayerId || redSourceExist;
+  const hasWhite = !!match.whitePlayerId || whiteSourceExist;
+
+  // It is a bye if:
+  // 1. Not finished
+  // 2. One side has presence (Player or Source)
+  // 3. The OTHER side is completely empty (No player AND No source)
+  const isBye = !match.result && ((hasRed && isWhiteEmpty) || (hasWhite && isRedEmpty));
+
+  return (
+    <div 
+      className={\`relative border rounded-xl p-4 shadow-sm bg-white flex flex-col gap-3 transition-all duration-300 hover:shadow-md
+      \${highlight ? 'ring-2 ring-blue-500' : ''} 
+      \${isFinished ? 'bg-gray-50/80' : 'border-slate-200'}
+      \`}
+    >
+      <div className="flex justify-between items-center text-xs font-bold border-b border-gray-100 pb-2 mb-1">
+        <span className="text-slate-400">MATCH #\${match.id}</span>
+        {match.result && <span className="text-green-600 bg-green-50 px-2 py-0.5 rounded-full">已完賽</span>}
+        {!match.result && isReady && <span className="text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full animate-pulse">進行中</span>}
+        {!match.result && isBye && <span className="text-orange-600 bg-orange-50 px-2 py-0.5 rounded-full">輪空待命</span>}
+      </div>
+
+      <div className="flex justify-between items-center gap-2">
+        {/* Red Side */}
+        <div className={\`flex flex-col items-center flex-1 p-2 rounded-lg transition-colors \${match.result?.winnerId === match.redPlayerId ? 'bg-red-50 ring-1 ring-red-100' : ''}\`}>
+          <div className="w-full h-1 bg-red-500 mb-2 rounded-full opacity-80"></div>
+          <span className={\`font-medium text-sm text-center break-all line-clamp-2 min-h-[2.5em] flex items-center \${match.result?.winnerId === match.redPlayerId ? 'text-red-700 font-bold' : 'text-slate-700'}\`}>
+            {redName || <span className="text-gray-300 italic text-xs">等待中...</span>}
+          </span>
+          {isFinished ? (
+               <span className="text-2xl font-black text-red-600 mt-1">{match.result?.redScore}</span>
+          ) : (
+               <span className="text-2xl font-black text-transparent mt-1 select-none">-</span>
+          )}
+        </div>
+
+        <div className="flex flex-col items-center justify-center">
+             <span className="text-slate-300 text-xs font-bold">VS</span>
+        </div>
+
+        {/* White Side */}
+        <div className={\`flex flex-col items-center flex-1 p-2 rounded-lg transition-colors \${match.result?.winnerId === match.whitePlayerId ? 'bg-gray-100 ring-1 ring-gray-200' : ''}\`}>
+          <div className="w-full h-1 bg-white border border-gray-300 mb-2 rounded-full"></div>
+          <span className={\`font-medium text-sm text-center break-all line-clamp-2 min-h-[2.5em] flex items-center \${match.result?.winnerId === match.whitePlayerId ? 'text-slate-900 font-bold' : 'text-slate-700'}\`}>
+            {whiteName || <span className="text-gray-300 italic text-xs">等待中...</span>}
+          </span>
+          {isFinished ? (
+               <span className="text-2xl font-black text-slate-700 mt-1">{match.result?.whiteScore}</span>
+          ) : (
+               <span className="text-2xl font-black text-transparent mt-1 select-none">-</span>
+          )}
+        </div>
+      </div>
+
+      {isReady && (
+        <button
+          onClick={() => onScore(match.id)}
+          className="mt-2 w-full py-2 bg-slate-800 hover:bg-slate-700 text-white text-sm font-bold rounded-lg transition-colors shadow-sm active:translate-y-0.5"
+        >
+          紀錄比分
+        </button>
+      )}
+      
+      {isBye && (
+        <button
+          onClick={() => onWalkover(match.id)}
+          className="mt-2 w-full py-2 bg-orange-100 hover:bg-orange-200 text-orange-800 border border-orange-200 text-sm font-bold rounded-lg transition-colors shadow-sm active:translate-y-0.5 flex items-center justify-center gap-1"
+        >
+           輪空晉級 (Walkover)
+        </button>
+      )}
+
+      {isFinished && (
+        <div className="text-xs text-center text-gray-500 mt-1 px-2 py-1 bg-gray-50 rounded border border-gray-100 truncate">
+          {match.result?.details || '無詳細紀錄'}
+        </div>
+      )}
+    </div>
+  );
+};`,
+  "components/BracketTree.tsx": `
+import React, { useMemo } from 'react';
+import { Match, Player } from '../types';
+
+interface BracketTreeProps {
+  matches: Match[];
+  players: Player[];
+  rootMatchId: number;
+}
+
+// Visual component for a single match node
+const MatchNode: React.FC<{ match: Match, players: Player[], allMatches: Match[] }> = ({ match: m, players, allMatches }) => {
+    
+    const getWaitingLabel = (matchId: number, slot: 'red' | 'white') => {
+        // Find if any match feeds into this slot
+        const winnerSource = allMatches.find(sourceMatch => 
+            (sourceMatch.winnerToMatchId === matchId && sourceMatch.winnerToSlot === slot) ||
+            (sourceMatch.winnerToMatchId === matchId && sourceMatch.winnerToSlot === null) 
+        );
+        if (winnerSource) return \`Wait W-#\${winnerSource.id}\`;
+
+        const loserSource = allMatches.find(sourceMatch => 
+            (sourceMatch.loserToMatchId === matchId && sourceMatch.loserToSlot === slot) ||
+            (sourceMatch.loserToMatchId === matchId && sourceMatch.loserToSlot === null)
+        );
+        if (loserSource) return \`Wait L-#\${loserSource.id}\`;
+
+        return "Waiting...";
+    };
+
+    const redName = m.redPlayerId ? players.find(p => p.id === m.redPlayerId)?.name : null;
+    const whiteName = m.whitePlayerId ? players.find(p => p.id === m.whitePlayerId)?.name : null;
+
+    return (
+        <div className={\`relative flex flex-col justify-center min-w-[200px] mb-4\`}>
+             <div className={\`border rounded-lg bg-white shadow-sm p-2 text-sm transition-all duration-300 
+                \${m.result ? 'border-slate-300 opacity-90' : 'border-blue-200 shadow-md ring-1 ring-blue-50'}
+             \`}>
+                <div className="flex justify-between mb-1 pb-1 border-b border-gray-50">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Match #\${m.id}</span>
+                    {m.result && <span className="text-[10px] bg-green-100 text-green-700 px-1.5 rounded-full">完賽</span>}
+                </div>
+                
+                {/* Red Player */}
+                <div className={\`flex items-center justify-between p-1 rounded-sm \${m.result?.winnerId === m.redPlayerId ? 'bg-red-50' : ''}\`}>
+                    <div className="flex items-center gap-2 overflow-hidden w-full">
+                        <div className={\`w-1.5 h-1.5 rounded-full shrink-0 \${m.result?.winnerId === m.redPlayerId ? 'bg-red-600' : 'bg-red-300'}\`}></div>
+                        <span className={\`truncate text-xs font-medium w-full \${m.result?.winnerId === m.redPlayerId ? 'text-red-700 font-bold' : 'text-slate-600'}\`}>
+                            {redName || <span className="text-slate-300 italic text-[10px]">{getWaitingLabel(m.id, 'red')}</span>}
+                        </span>
+                    </div>
+                     {m.result && <span className="text-xs font-bold text-red-600 ml-1">{m.result.redScore}</span>}
+                </div>
+
+                {/* White Player */}
+                <div className={\`flex items-center justify-between p-1 rounded-sm mt-0.5 \${m.result?.winnerId === m.whitePlayerId ? 'bg-slate-100' : ''}\`}>
+                     <div className="flex items-center gap-2 overflow-hidden w-full">
+                        <div className={\`w-1.5 h-1.5 rounded-full border border-gray-400 bg-white shrink-0\`}></div>
+                        <span className={\`truncate text-xs font-medium w-full \${m.result?.winnerId === m.whitePlayerId ? 'text-slate-900 font-bold' : 'text-slate-600'}\`}>
+                            {whiteName || <span className="text-slate-300 italic text-[10px]">{getWaitingLabel(m.id, 'white')}</span>}
+                        </span>
+                    </div>
+                     {m.result && <span className="text-xs font-bold text-slate-800 ml-1">{m.result.whiteScore}</span>}
+                </div>
+             </div>
+             
+             {/* Connector Line (Right - Output) */}
+             <div className="absolute -right-4 top-1/2 w-4 h-px bg-slate-300 hidden md:block"></div>
+        </div>
+    )
+}
+
+export const BracketTree: React.FC<BracketTreeProps> = ({ matches, players, rootMatchId }) => {
+  
+  // Calculate the layout by finding "Distance from Root"
+  const levels = useMemo(() => {
+      const matchDepthMap = new Map<number, number>();
+      const maxDepth = 10; // Safety limit
+
+      // Helper to calculate depth recursively (Reverse DFS)
+      const calculateDepth = (matchId: number, currentDepth: number) => {
+          if (currentDepth > maxDepth) return;
+          
+          // Update depth if this path is longer (pushed further left)
+          const existing = matchDepthMap.get(matchId) || -1;
+          if (currentDepth > existing) {
+              matchDepthMap.set(matchId, currentDepth);
+          }
+
+          // Find matches that feed INTO this match (either Winner OR Loser)
+          const feeders = matches.filter(m => m.winnerToMatchId === matchId || m.loserToMatchId === matchId);
+          feeders.forEach(f => calculateDepth(f.id, currentDepth + 1));
+      };
+
+      // Start from root
+      calculateDepth(rootMatchId, 0);
+
+      // Handle disconnected components (orphans) - assign them to deepest level available or level 0
+      matches.forEach(m => {
+          if (!matchDepthMap.has(m.id)) {
+             // If unlinked, we try to place it based on if it feeds anything
+             const parent = matches.find(p => p.id === m.winnerToMatchId || p.id === m.loserToMatchId);
+             if (parent && matchDepthMap.has(parent.id)) {
+                 calculateDepth(m.id, matchDepthMap.get(parent.id)! + 1);
+             } else {
+                 matchDepthMap.set(m.id, 0);
+             }
+          }
+      });
+
+      // Group by depth
+      const maxFoundDepth = Math.max(...Array.from(matchDepthMap.values()), 0);
+      const organizedLevels: Match[][] = [];
+
+      // We want to render from Left (Max Depth) to Right (Depth 0)
+      for (let d = maxFoundDepth; d >= 0; d--) {
+          const depthMatches = matches
+            .filter(m => matchDepthMap.get(m.id) === d)
+            .sort((a,b) => a.id - b.id); // Sort by ID within level
+          organizedLevels.push(depthMatches);
+      }
+      
+      return organizedLevels;
+  }, [matches, rootMatchId]);
+
+  return (
+    <div className="overflow-auto bracket-scroll p-6 bg-slate-50/50 rounded-xl border border-slate-100 h-full">
+        <div className="flex gap-8 min-w-max h-full items-stretch">
+            {levels.map((levelMatches, idx) => {
+                const isFinal = idx === levels.length - 1;
+                const roundName = isFinal ? "決賽 (Finals)" : \`Round \${idx + 1}\`;
+                
+                return (
+                    <div key={idx} className="flex flex-col justify-around gap-4 min-w-[200px]">
+                        <h3 className={\`text-center font-bold text-xs tracking-wider uppercase mb-2 sticky top-0 py-2 z-10 backdrop-blur-sm \${isFinal ? 'text-yellow-600 bg-yellow-50/90' : 'text-slate-400 bg-slate-50/90'}\`}>
+                            {roundName}
+                        </h3>
+                        <div className="flex flex-col justify-center h-full gap-8">
+                            {levelMatches.map(m => (
+                                <MatchNode 
+                                    key={m.id} 
+                                    match={m} 
+                                    players={players} 
+                                    allMatches={matches}
+                                />
+                            ))}
+                        </div>
+                    </div>
+                );
+            })}
+        </div>
+    </div>
+  );
+};`,
+  "App.tsx": `import React, { useState, useEffect, useRef } from 'react';
 import { analyzeBracketImage } from './services/geminiService';
 import { Match, Player, TournamentData, MatchResult } from './types';
 import { MatchCard } from './components/MatchCard';
@@ -61,7 +509,7 @@ const App = () => {
   };
 
   const createNewTournament = () => {
-      const newId = `t${Date.now()}`;
+      const newId = \`t\${Date.now()}\`;
       const newTournament: TournamentData = {
           id: newId,
           lastUpdated: Date.now(),
@@ -105,34 +553,34 @@ const App = () => {
       const processCode = (code: string) => {
           if (!code) return '';
           return code
-            .replace(/import\s+.*from\s+['"].*['"];/g, '') // Remove local imports
-            .replace(/export\s+default\s+/g, '') // Remove export default
-            .replace(/export\s+/g, ''); // Remove named exports
+            .replace(/import\\s+.*from\\s+['"].*['"];/g, '') // Remove local imports
+            .replace(/export\\s+default\\s+/g, '') // Remove export default
+            .replace(/export\\s+/g, ''); // Remove named exports
       };
 
       // We need to inject the FILES object roughly so the deployed app can theoretically re-download itself or use references
       // But for simplicity in the standalone HTML, we skip the sourceCode.ts logic inside the bundle to avoid massive file size doubling.
       
-      const bundledScript = `
-        ${processCode(FILES['types.ts'])}
-        ${processCode(FILES['services/geminiService.ts'])}
-        ${processCode(FILES['components/MatchCard.tsx'])}
-        ${processCode(FILES['components/BracketTree.tsx'])}
+      const bundledScript = \`
+        \${processCode(FILES['types.ts'])}
+        \${processCode(FILES['services/geminiService.ts'])}
+        \${processCode(FILES['components/MatchCard.tsx'])}
+        \${processCode(FILES['components/BracketTree.tsx'])}
         
         // Mock FILES for the standalone app so it doesn't crash if referenced
         const FILES = {}; 
 
         // --- Modified App Logic for Standalone ---
-        ${processCode(FILES['App.tsx'])
+        \${processCode(FILES['App.tsx'])
             .replace('downloadSourceCode', 'downloadSourceCode = () => alert("此為部署版本，無法下載原始碼")') // Disable download in deployed version
-            .replace(/<button.*下載GitHub專用檔.*<\/button>/, '') // Hide the button UI roughly
+            .replace(/<button.*下載GitHub專用檔.*<\\/button>/, '') // Hide the button UI roughly
         }
 
         const root = ReactDOM.createRoot(document.getElementById('root'));
         root.render(<App />);
-      `;
+      \`;
 
-      return `<!DOCTYPE html>
+      return \`<!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -178,10 +626,10 @@ const App = () => {
   <body>
     <div id="root"></div>
     <script type="text/babel" data-presets="react,typescript">
-      ${bundledScript}
+      \${bundledScript}
     </script>
   </body>
-</html>`;
+</html>\`;
   };
 
   const downloadSourceCode = async () => {
@@ -225,7 +673,7 @@ const App = () => {
         try {
           const extracted = await analyzeBracketImage(base64);
           const initialPlayers = extracted.players.map((name, idx) => ({
-            id: `p${idx + 1}`,
+            id: \`p\${idx + 1}\`,
             name
           }));
           
@@ -586,7 +1034,7 @@ const App = () => {
                   <div key={t.id} onClick={() => openTournament(t)} className="bg-white p-5 rounded-xl border border-slate-200 hover:border-blue-400 hover:shadow-md cursor-pointer transition group relative">
                        <div className="flex justify-between items-start mb-2">
                            <h3 className="font-bold text-lg text-slate-800 line-clamp-1">{t.title}</h3>
-                           <span className={`text-xs px-2 py-1 rounded-full ${t.status === 'FINISHED' ? 'bg-green-100 text-green-700' : t.status === 'ACTIVE' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600'}`}>
+                           <span className={\`text-xs px-2 py-1 rounded-full \${t.status === 'FINISHED' ? 'bg-green-100 text-green-700' : t.status === 'ACTIVE' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600'}\`}>
                                {t.status === 'FINISHED' ? '已結束' : t.status === 'ACTIVE' ? '進行中' : '設定中'}
                            </span>
                        </div>
@@ -689,12 +1137,12 @@ const App = () => {
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-2">參賽選手名單 ({editorData?.players.length} 位)</label>
           <textarea
-            value={editorData?.players.map(p => p.name).join('\n') || ''}
+            value={editorData?.players.map(p => p.name).join('\\n') || ''}
             onChange={(e) => {
-              const names = e.target.value.split('\n').filter(n => n.trim());
+              const names = e.target.value.split('\\n').filter(n => n.trim());
               setEditorData(prev => prev ? ({
                 ...prev,
-                players: names.map((n, i) => ({ id: `p${i+1}`, name: n.trim() }))
+                players: names.map((n, i) => ({ id: \`p\${i+1}\`, name: n.trim() }))
               }) : null);
             }}
             className="w-full h-48 p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none font-mono text-sm"
@@ -747,8 +1195,8 @@ const App = () => {
             const whiteSources = getSlotSource(match.id, 'white');
 
             // Determine if dropdowns should be locked
-            const isRedLocked = redSources.length > 0 && !unlockedSlots[`${match.id}-red`];
-            const isWhiteLocked = whiteSources.length > 0 && !unlockedSlots[`${match.id}-white`];
+            const isRedLocked = redSources.length > 0 && !unlockedSlots[\`\${match.id}-red\`];
+            const isWhiteLocked = whiteSources.length > 0 && !unlockedSlots[\`\${match.id}-white\`];
 
             return (
           <div key={match.id} className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm relative group hover:border-blue-400 transition">
@@ -768,12 +1216,12 @@ const App = () => {
                     <label className="text-xs font-bold text-red-700 mb-1 block flex justify-between">
                         紅方 (Red)
                         {isRedLocked && (
-                             <button onClick={() => setUnlockedSlots(prev => ({...prev, [`${match.id}-red`]: true}))} className="text-gray-300 hover:text-gray-500">
+                             <button onClick={() => setUnlockedSlots(prev => ({...prev, [\`\${match.id}-red\`]: true}))} className="text-gray-300 hover:text-gray-500">
                                  <Lock className="w-3 h-3" />
                              </button>
                         )}
                         {!isRedLocked && redSources.length > 0 && (
-                            <button onClick={() => setUnlockedSlots(prev => ({...prev, [`${match.id}-red`]: false}))} className="text-gray-300 hover:text-gray-500">
+                            <button onClick={() => setUnlockedSlots(prev => ({...prev, [\`\${match.id}-red\`]: false}))} className="text-gray-300 hover:text-gray-500">
                                  <Unlock className="w-3 h-3" />
                             </button>
                         )}
@@ -803,12 +1251,12 @@ const App = () => {
                      <label className="text-xs font-bold text-slate-700 mb-1 block flex justify-between">
                         白方 (White)
                         {isWhiteLocked && (
-                             <button onClick={() => setUnlockedSlots(prev => ({...prev, [`${match.id}-white`]: true}))} className="text-gray-300 hover:text-gray-500">
+                             <button onClick={() => setUnlockedSlots(prev => ({...prev, [\`\${match.id}-white\`]: true}))} className="text-gray-300 hover:text-gray-500">
                                  <Lock className="w-3 h-3" />
                              </button>
                         )}
                         {!isWhiteLocked && whiteSources.length > 0 && (
-                            <button onClick={() => setUnlockedSlots(prev => ({...prev, [`${match.id}-white`]: false}))} className="text-gray-300 hover:text-gray-500">
+                            <button onClick={() => setUnlockedSlots(prev => ({...prev, [\`\${match.id}-white\`]: false}))} className="text-gray-300 hover:text-gray-500">
                                  <Unlock className="w-3 h-3" />
                             </button>
                         )}
@@ -921,7 +1369,7 @@ const App = () => {
              </span>
           </div>
           <div className="w-full bg-gray-100 h-2 rounded-full overflow-hidden">
-             <div className="bg-blue-500 h-full transition-all duration-500" style={{ width: `${(finishedCount/totalCount)*100}%` }}></div>
+             <div className="bg-blue-500 h-full transition-all duration-500" style={{ width: \`\${(finishedCount/totalCount)*100}%\` }}></div>
           </div>
         </div>
         
@@ -1050,7 +1498,7 @@ const App = () => {
                       <button 
                         key={n}
                         onClick={() => setRankingLimit(n)}
-                        className={`px-3 py-1 text-xs rounded-full border ${rankingLimit === n ? 'bg-slate-800 text-white border-slate-800' : 'text-slate-500 border-slate-200 hover:bg-slate-50'}`}
+                        className={\`px-3 py-1 text-xs rounded-full border \${rankingLimit === n ? 'bg-slate-800 text-white border-slate-800' : 'text-slate-500 border-slate-200 hover:bg-slate-50'}\`}
                       >
                           Top {n}
                       </button>
@@ -1061,11 +1509,11 @@ const App = () => {
                   {rankings.map((r, idx) => (
                       <div key={idx} className="flex items-center justify-between p-4 bg-slate-50 rounded-xl border border-slate-100 hover:border-yellow-200 transition group">
                           <div className="flex items-center gap-4">
-                              <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm shadow-sm
-                                ${r.rankOrder === 1 ? 'bg-yellow-100 text-yellow-700' : 
+                              <div className={\`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm shadow-sm
+                                \${r.rankOrder === 1 ? 'bg-yellow-100 text-yellow-700' : 
                                   r.rankOrder === 2 ? 'bg-gray-200 text-gray-700' : 
                                   r.rankOrder === 3 ? 'bg-orange-100 text-orange-800' : 'bg-white border border-slate-200 text-slate-500'}
-                              `}>
+                              \`}>
                                   {r.rankOrder}
                               </div>
                               <div>
@@ -1114,8 +1562,8 @@ const App = () => {
         </div>
         <div className="flex items-center gap-4 text-sm">
             {['上傳/設定', '確認資訊', '賽程結構', '進行比賽', '最終排名'].map((step, idx) => (
-                <div key={idx} className={`flex items-center gap-2 ${setupStep >= idx ? 'text-blue-600 font-medium' : 'text-slate-300'}`}>
-                    <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs ${setupStep >= idx ? 'bg-blue-100' : 'border border-slate-200'}`}>
+                <div key={idx} className={\`flex items-center gap-2 \${setupStep >= idx ? 'text-blue-600 font-medium' : 'text-slate-300'}\`}>
+                    <span className={\`w-6 h-6 rounded-full flex items-center justify-center text-xs \${setupStep >= idx ? 'bg-blue-100' : 'border border-slate-200'}\`}>
                         {idx + 1}
                     </span>
                     <span className="hidden md:inline">{step}</span>
@@ -1137,4 +1585,5 @@ const App = () => {
   );
 };
 
-export default App;
+export default App;`
+};
